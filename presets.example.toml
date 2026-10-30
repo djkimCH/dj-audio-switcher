@@ -1,4 +1,8 @@
 # Audio Switcher presets
+#
+# NOTE: these are X1Ubuntu's devices (Odyssey screen, C920 webcam, Razer, Jabra).
+# On another machine replace the output/input names with yours (see README section 5,
+# issue #1).
 # Edit + save: the top-bar menu picks up changes within ~2 seconds.
 #
 #   name    shown in the menu

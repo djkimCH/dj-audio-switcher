@@ -21,7 +21,7 @@ mic — an app pinned to a specific device ignores the switch.
 ## 2. Presets
 
 File: `~/.config/audio-switcher/presets.toml` (machine-local, created from
-[presets.example.toml](presets.example.toml) on first run). Changes are picked up within ~2 s.
+[presets.example.toml](presets.example.toml) on first run; the example holds X1Ubuntu's devices, so adapt it on other machines, see §5). Changes are picked up within ~2 s.
 
 ```toml
 [[preset]]
@@ -67,6 +67,12 @@ Creates `~/.config/autostart/audio-switcher.desktop` and a GNOME custom shortcut
 
 ## 5. Known limitations
 
+- **Fresh install on another machine: all presets greyed out**
+  ([issue #1](https://github.com/djkimCH/dj-audio-switcher/issues/1)). The example presets are
+  X1Ubuntu's devices, so elsewhere they show as "(not connected)". Output/Input submenus work.
+  **Workaround:** run `python3 audio-switcher.py --list`, then use "Edit presets…" and put
+  parts of the listed names into `output` / `input` (e.g. `output = "Jabra"`). Delete presets
+  you don't need.
 - The tip is not always exactly at the mouse (accepted 2026-10-30 as good enough). The
   placement still drifts somewhat, more the farther the mouse is from the screen center.
 - The overlay appears on the screen GNOME chooses. If the mouse is on the other screen, the
