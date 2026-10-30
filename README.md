@@ -33,7 +33,7 @@ mic — an app pinned to a specific device ignores the switch.
 ## 2. Presets
 
 File: `~/.config/audio-switcher/presets.toml` (machine-local, created from
-[presets.example.toml](presets.example.toml) on first run; the example holds X1Ubuntu's devices, so adapt it on other machines, see §7). Changes are picked up within ~1 s.
+[presets.example.toml](presets.example.toml) on first run; the example holds X1Ubuntu's devices, so adapt it on other machines, see §7). Changes are picked up within ~2 s.
 
 ```toml
 [[preset]]
@@ -55,9 +55,15 @@ an output after 5 s of silence, so the headset receives nothing and its timer ru
 **Fix:** top-bar menu → **Advanced ▸ Keep awake** → tick the headset. Off by default, per device.
 While **an app records from that headset's mic** (call, dictation; GNOME shows the mic symbol in
 the top bar), the tool plays **inaudible silence** to the headset, so its timer never runs out.
-This works whether or not the headset is the selected device. As soon as no app uses the mic, the
-silence stops and the headset's own timer applies again, which saves battery. While active, the
-submenu shows "Now keeping … awake".
+This works whether or not the headset is the selected device.
+
+**Also while you use the computer** (same submenu, off by default): keeps the headset awake as
+well while it is **selected** (its output or its mic is the default) **and** you used keyboard or
+mouse in the last 15 minutes (GNOME idle time), e.g. while you read or type between dictations.
+Change the minutes with `"idle_minutes"` under `"keepalive"` in `settings.json`.
+
+Otherwise the silence stops and the headset's own timer applies again, which saves battery. While
+active, the submenu shows "Now keeping … awake".
 
 Stored in `~/.config/audio-switcher/settings.json` (managed by the menu).
 
@@ -71,7 +77,7 @@ Side effect: the cue also resets the auto-off timer of a headset at every record
 short recordings (dictation, voice messages) it already prevents the headset from switching off.
 For long recordings use Keep awake (§3).
 
-Notes: detection polls every second, so the cue comes ~0.5–1 s after recording starts. Opening
+Notes: the cue comes ~0.05–0.15 s after recording starts (measured). Opening
 GNOME's sound settings also triggers it (its input level meter records). Other sound:
 `"sound": "/path/to/file.oga"` under `"miccue"` in `settings.json`.
 
@@ -90,14 +96,19 @@ Creates `~/.config/autostart/audio-switcher.desktop` and a GNOME custom shortcut
 
 ## 6. How it works
 
-- **State:** `pw-dump` every 1 s (~20 ms). Ports PipeWire reports as unavailable (empty HDMI
-  ports, unplugged jack) are hidden — same list as GNOME's own sound menu.
+- **State:** `pw-dump` (~20 ms), run right after a PipeWire link appears (a `pw-mon` child
+  process is watched for added `Link` objects, bursts coalesced to one read after 30 ms), plus
+  every 2 s as fallback. Only links count: each `pw-dump` shows up as a new client, so reacting
+  to every new object would loop (seen: 40 % CPU). `pw-mon` is restarted if it exits. Ports PipeWire reports
+  as unavailable (empty HDMI ports, unplugged jack) are hidden — same list as GNOME's own sound menu.
 - **Switch:** `wpctl set-default <id>`; ids are looked up fresh by stable `node.name`.
 - **Keep awake:** a `pw-cat --playback --target <headset>` stream fed from `/dev/zero`, started
-  and stopped by the 1 s poll. "Recording" = a PipeWire link from the headset's mic (same
-  device id as the ticked output) to an app's input stream. The stream
+  and stopped on each state read. "Recording" = a PipeWire link from the headset's mic (same
+  device id as the ticked output) to an app's input stream. "Use the computer" = Mutter's
+  `org.gnome.Mutter.IdleMonitor.GetIdletime` over D-Bus (in-process, only asked when needed;
+  unknown counts as active). The stream
   dies with the menu process (`PR_SET_PDEATHSIG`).
-- **Mic cue:** the same poll compares which mics are recorded with the previous poll; a newly
+- **Mic cue:** each state read compares which mics are recorded with the previous read; a newly
   recorded (enabled) mic plays the cue with `pw-play` on the default output.
 - **Menu:** separate Python process, not a GNOME Shell extension → a bug can't crash the session
   and GNOME upgrades don't require porting (relies only on Ubuntu's AppIndicator extension).

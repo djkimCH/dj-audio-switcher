@@ -23,7 +23,7 @@ APP_ID = "net.djelid.AudioSwitcher"
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "audio-switcher" / "presets.toml"
 EXAMPLE = Path(__file__).resolve().parent / "presets.example.toml"
 SETTINGS = CONFIG.parent / "settings.json"   # app-managed (Advanced menu), not hand-edited
-POLL_SECONDS = 1
+POLL_SECONDS = 2      # fallback; PwEvents reacts to new recordings at once
 DEFAULT_CUE = "/usr/share/sounds/Yaru/stereo/message.oga"
 
 
@@ -63,8 +63,19 @@ def _int(v):
         return None
 
 
+def _pw_dump():
+    # While objects change (e.g. right after an app starts recording), pw-dump can
+    # append an update after the snapshot: retry, else use the first snapshot.
+    for _ in range(3):
+        out = subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=5).stdout
+        objs, end = json.JSONDecoder().raw_decode(out)
+        if not out[end:].strip():
+            return objs
+    return objs
+
+
 def read_state():
-    objs = json.loads(subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=5).stdout)
+    objs = _pw_dump()
 
     # Ports whose every route reports available=no (e.g. HDMI with nothing
     # plugged in) are hidden, same as GNOME's own sound menu does.
@@ -200,21 +211,45 @@ def save_settings(data):
 
 
 def load_keepalive():
-    """Advanced > Keep awake: tuple of output node names it is enabled for."""
+    """Advanced > Keep awake: (output node names, while_active, idle_minutes)."""
     ka = load_settings().get("keepalive") or {}
-    return tuple(d for d in ka.get("devices", []) if isinstance(d, str))
+    devices = tuple(d for d in ka.get("devices", []) if isinstance(d, str))
+    try:
+        idle_minutes = float(ka.get("idle_minutes", 15))
+    except (TypeError, ValueError):
+        idle_minutes = 15.0
+    return devices, bool(ka.get("while_active")), idle_minutes
 
 
-def toggle_keepalive(node_name):
+def toggle_keepalive(node_name=None):
+    """None toggles "Also while you use the computer", else one headset."""
     data = load_settings()
     ka = data.setdefault("keepalive", {"devices": []})
-    ka.pop("idle_minutes", None)
-    devices = ka.setdefault("devices", [])
-    if node_name in devices:
-        devices.remove(node_name)
+    if node_name is None:
+        ka["while_active"] = not ka.get("while_active")
     else:
-        devices.append(node_name)
+        devices = ka.setdefault("devices", [])
+        devices.remove(node_name) if node_name in devices else devices.append(node_name)
     save_settings(data)
+
+
+_session_bus = None
+
+
+def idle_ms():
+    """Milliseconds since the last keyboard/mouse input (GNOME), None if unknown."""
+    global _session_bus
+    try:
+        from gi.repository import Gio, GLib
+        if _session_bus is None:
+            _session_bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        reply = _session_bus.call_sync(
+            "org.gnome.Mutter.IdleMonitor", "/org/gnome/Mutter/IdleMonitor/Core",
+            "org.gnome.Mutter.IdleMonitor", "GetIdletime", None, GLib.VariantType("(t)"),
+            Gio.DBusCallFlags.NONE, 1000, None)
+        return reply.unpack()[0]
+    except Exception:
+        return None
 
 
 def load_miccue():
@@ -260,25 +295,34 @@ class MicCue:
 class KeepAlive:
     """Plays inaudible silence to a headset while an app records from its mic,
     so the headset's own auto-off timer (which only counts incoming sound)
-    doesn't fire during calls or dictation. No mic use -> its timer applies."""
+    doesn't fire during calls or dictation. Optionally also while the headset
+    is selected and the user is at the computer. Otherwise its timer applies."""
 
     def __init__(self):
         self.proc = None
         self.target = None      # node.name currently kept awake
 
-    def update(self, state, enabled):
+    def update(self, state, cfg):
         if self.proc and self.proc.poll() is not None:   # stream died (headset off)
             self.proc, self.target = None, None
+        enabled, while_active, idle_minutes = cfg
         want = None
+        idle = ...   # queried at most once, only when needed
         for sink in state.sinks:
             if sink.name not in enabled:
                 continue
             # the headset's mic = a source on the same hardware device
-            mic_in_use = any(n.device is not None and n.device == sink.device and n.name in state.recording
-                             for n in state.sources)
-            if mic_in_use:
+            mics = [n for n in state.sources if n.device is not None and n.device == sink.device]
+            if any(n.name in state.recording for n in mics):
                 want = sink.name
                 break
+            selected = sink.name == state.default_sink or any(n.name == state.default_source for n in mics)
+            if while_active and selected:
+                if idle is ...:
+                    idle = idle_ms()
+                if idle is None or idle < idle_minutes * 60_000:
+                    want = sink.name
+                    break
         if want != self.target:
             self.stop()
             if want:
@@ -307,6 +351,72 @@ class KeepAlive:
             except subprocess.TimeoutExpired:
                 self.proc.kill()
         self.proc, self.target = None, None
+
+
+class PwEvents:
+    """Calls on_change() right after a PipeWire link appears (an app starts
+    recording or playing), so the cue isn't delayed by the poll. Uses `pw-mon`;
+    the timed poll stays as fallback. Only links count: every pw-dump shows up
+    as a new client, so reacting to all objects would loop."""
+
+    def __init__(self, on_change):
+        self.on_change = on_change
+        self.proc = None
+        self.pending = False
+        self.buf = b""
+        self.in_added = False   # inside an "added:" block of pw-mon's output
+
+    def start(self):
+        from gi.repository import GLib
+        import ctypes
+        import signal
+
+        def die_with_parent():
+            ctypes.CDLL("libc.so.6").prctl(1, signal.SIGTERM)   # PR_SET_PDEATHSIG
+        try:
+            self.proc = subprocess.Popen(
+                ["stdbuf", "-oL", "pw-mon", "--no-colors", "--hide-props", "--hide-params"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, preexec_fn=die_with_parent)
+        except OSError as e:
+            print(f"audio-switcher: pw-mon not started: {e}", file=sys.stderr)
+            return False
+        os.set_blocking(self.proc.stdout.fileno(), False)
+        GLib.io_add_watch(self.proc.stdout.fileno(), GLib.PRIORITY_DEFAULT,
+                          GLib.IOCondition.IN | GLib.IOCondition.HUP | GLib.IOCondition.ERR, self._read)
+        return False
+
+    def _read(self, fd, cond):
+        from gi.repository import GLib
+        changed = False
+        while True:
+            try:
+                chunk = os.read(fd, 65536)
+            except BlockingIOError:
+                break
+            if not chunk:   # pw-mon exited (PipeWire restart): retry in 5 s
+                self.proc.wait()
+                self.proc, self.buf, self.in_added = None, b"", False
+                GLib.timeout_add_seconds(5, self.start)
+                return False
+            *lines, self.buf = (self.buf + chunk).split(b"\n")
+            for line in lines:
+                if line.rstrip() in (b"added:", b"changed:", b"removed:"):   # block header
+                    self.in_added = line.startswith(b"added:")
+                elif self.in_added and line.strip().startswith(b"type: PipeWire:Interface:Link"):
+                    changed = True
+        if changed and not self.pending:   # coalesce a burst of events into one refresh
+            self.pending = True
+            GLib.timeout_add(30, self._fire)
+        return True
+
+    def _fire(self):
+        self.pending = False
+        self.on_change()
+        return False
+
+    def stop(self):
+        if self.proc:
+            self.proc.terminate()
 
 
 def apply_preset(preset, notify_user=True):
@@ -401,12 +511,18 @@ def run_indicator():
         keep_menu.append(info_item("For headsets that switch off by themselves:"))
         keep_menu.append(info_item("plays silence while an app uses its mic"))
         keep_menu.append(Gtk.SeparatorMenuItem())
-        enabled = load_keepalive()
+        enabled, while_active, idle_minutes = load_keepalive()
         for n in state.sinks:
             item = Gtk.CheckMenuItem(label=n.label)
             item.set_active(n.name in enabled)
             item.connect("activate", lambda _i, n=n: (toggle_keepalive(n.name), refresh(force=True)))
             keep_menu.append(item)
+        keep_menu.append(Gtk.SeparatorMenuItem())
+        active_item = Gtk.CheckMenuItem(label="Also while you use the computer")
+        active_item.set_active(while_active)
+        active_item.connect("activate", lambda _i: (toggle_keepalive(), refresh(force=True)))
+        keep_menu.append(active_item)
+        keep_menu.append(info_item(f"(headset selected, keyboard/mouse in the last {idle_minutes:g} min)"))
         if keepalive.target:
             label = next((n.label for n in state.sinks if n.name == keepalive.target), keepalive.target)
             keep_menu.append(Gtk.SeparatorMenuItem())
@@ -483,9 +599,12 @@ def run_indicator():
 
     refresh()
     GLib.timeout_add_seconds(POLL_SECONDS, refresh)
+    events = PwEvents(refresh)
+    events.start()
     try:
         Gtk.main()
     finally:
+        events.stop()
         keepalive.stop()
 
 
