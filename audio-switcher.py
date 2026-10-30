@@ -22,6 +22,7 @@ from pathlib import Path
 APP_ID = "net.djelid.AudioSwitcher"
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "audio-switcher" / "presets.toml"
 EXAMPLE = Path(__file__).resolve().parent / "presets.example.toml"
+SETTINGS = CONFIG.parent / "settings.json"   # app-managed (Advanced menu), not hand-edited
 POLL_SECONDS = 2
 
 
@@ -34,6 +35,7 @@ class Node:
     label: str     # short name shown in menus (node.nick)
     desc: str      # long description
     usb: bool
+    device: int = None   # PipeWire device id: a headset's speaker and mic share it
 
     def matches(self, pattern):
         p = pattern.lower()
@@ -46,6 +48,7 @@ class State:
     sources: tuple
     default_sink: str
     default_source: str
+    recording: frozenset = frozenset()   # source names an app is recording from
 
     def signature(self):
         return (tuple(n.name for n in self.sinks), tuple(n.name for n in self.sources),
@@ -77,6 +80,15 @@ def read_state():
                 unavailable.add((o["id"], dev))
 
     sinks, sources, defaults = [], [], {}
+    node_props = {o["id"]: ((o.get("info") or {}).get("props") or {})
+                  for o in objs if o.get("type") == "PipeWire:Interface:Node"}
+    recording = set()
+    for o in objs:
+        if o.get("type") == "PipeWire:Interface:Link":
+            info = o.get("info") or {}
+            dst = node_props.get(info.get("input-node-id"), {})
+            if dst.get("media.class") == "Stream/Input/Audio":
+                recording.add(node_props.get(info.get("output-node-id"), {}).get("node.name", ""))
     for o in objs:
         t = o.get("type")
         if t == "PipeWire:Interface:Metadata" and (o.get("props") or {}).get("metadata.name") == "default":
@@ -99,13 +111,14 @@ def read_state():
             name = p.get("node.name", "")
             desc = p.get("node.description", name)
             node = Node(o["id"], name, p.get("node.nick") or desc, desc,
-                        p.get("device.bus") == "usb" or ".usb-" in name)
+                        p.get("device.bus") == "usb" or ".usb-" in name, _int(p.get("device.id")))
             (sinks if cls == "Audio/Sink" else sources).append(node)
 
     sinks.sort(key=lambda n: n.label.lower())
     sources.sort(key=lambda n: n.label.lower())
     return State(tuple(sinks), tuple(sources),
-                 defaults.get("default.audio.sink", ""), defaults.get("default.audio.source", ""))
+                 defaults.get("default.audio.sink", ""), defaults.get("default.audio.source", ""),
+                 frozenset(recording))
 
 
 def set_default(node):
@@ -170,6 +183,108 @@ def load_presets():
     return presets, None
 
 
+def load_settings():
+    try:
+        data = json.loads(SETTINGS.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(data):
+    SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+    tmp = SETTINGS.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(SETTINGS)
+
+
+def load_keepalive():
+    """Advanced > Keep awake: (device node names, idle_minutes) or None."""
+    ka = load_settings().get("keepalive") or {}
+    devices = tuple(d for d in ka.get("devices", []) if isinstance(d, str))
+    return (devices, float(ka.get("idle_minutes", 15))) if devices else None
+
+
+def toggle_keepalive(node_name):
+    data = load_settings()
+    ka = data.setdefault("keepalive", {"devices": [], "idle_minutes": 15})
+    devices = ka.setdefault("devices", [])
+    if node_name in devices:
+        devices.remove(node_name)
+    else:
+        devices.append(node_name)
+    save_settings(data)
+
+
+def idle_ms():
+    """Milliseconds since the last keyboard/mouse input (GNOME), None if unknown."""
+    try:
+        out = subprocess.run(["gdbus", "call", "--session", "--dest", "org.gnome.Mutter.IdleMonitor",
+                              "--object-path", "/org/gnome/Mutter/IdleMonitor/Core",
+                              "--method", "org.gnome.Mutter.IdleMonitor.GetIdletime"],
+                             capture_output=True, text=True, timeout=2).stdout
+        return int(out.strip().strip("(),").split()[-1])
+    except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+        return None
+
+
+class KeepAlive:
+    """Plays inaudible silence to a headset so its own auto-off timer doesn't
+    fire while it's in use. Runs only while the headset (output or mic) is
+    selected AND the user is active (recent keyboard/mouse input, or an app is
+    recording from its mic). Otherwise the headset's own timer applies."""
+
+    def __init__(self):
+        self.proc = None
+        self.target = None      # node.name currently kept awake
+
+    def update(self, state, cfg):
+        if self.proc and self.proc.poll() is not None:   # stream died (headset off)
+            self.proc, self.target = None, None
+        want = None
+        if cfg:
+            patterns, idle_minutes = cfg
+            sink = _find(state.sinks, patterns)
+            # the headset's mic = a source on the same hardware device
+            source = next((n for n in state.sources
+                           if sink and n.device is not None and n.device == sink.device), None)
+            selected = ((sink and sink.name == state.default_sink)
+                        or (source and source.name == state.default_source))
+            recording = source is not None and source.name in state.recording
+            idle = idle_ms()
+            active = recording or idle is None or idle < idle_minutes * 60_000
+            if sink and selected and active:
+                want = sink.name
+        if want != self.target:
+            self.stop()
+            if want:
+                self.start(want)
+
+    def start(self, sink_name):
+        import ctypes
+        import signal
+
+        def die_with_parent():
+            ctypes.CDLL("libc.so.6").prctl(1, signal.SIGTERM)   # PR_SET_PDEATHSIG
+        with open("/dev/zero", "rb") as zero:
+            self.proc = subprocess.Popen(
+                ["pw-cat", "--playback", "--target", sink_name, "--format", "s16", "--rate", "48000",
+                 "--channels", "2", "--latency", "500ms",
+                 "-P", '{ media.name = "Headset keep-alive" node.dont-reconnect = true }', "-"],
+                stdin=zero, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                preexec_fn=die_with_parent)
+        self.target = sink_name
+
+    def stop(self):
+        if self.proc:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        self.proc, self.target = None, None
+
+
 def apply_preset(preset, notify_user=True):
     state = read_state()
     sink, source, missing = preset.resolve(state)
@@ -223,6 +338,7 @@ def run_indicator():
     ind.set_status(AI.IndicatorStatus.ACTIVE)
     ind.set_title("Audio Switcher")
     last = {"sig": None}
+    keepalive = KeepAlive()
 
     def radio(label, active, sensitive, callback):
         item = Gtk.CheckMenuItem(label=label)
@@ -247,6 +363,35 @@ def run_indicator():
         top.set_submenu(sub)
         return top
 
+    def info_item(label):
+        item = Gtk.MenuItem(label=label)
+        item.set_sensitive(False)
+        return item
+
+    def advanced_submenu(state):
+        top = Gtk.MenuItem(label="Advanced")
+        sub = Gtk.Menu()
+        keep = Gtk.MenuItem(label="Keep awake")
+        keep_menu = Gtk.Menu()
+        keep_menu.append(info_item("For headsets that switch off by themselves:"))
+        keep_menu.append(info_item("plays silence while selected and you're active"))
+        keep_menu.append(Gtk.SeparatorMenuItem())
+        cfg = load_keepalive()
+        enabled = cfg[0] if cfg else ()
+        for n in state.sinks:
+            item = Gtk.CheckMenuItem(label=n.label)
+            item.set_active(n.name in enabled)
+            item.connect("activate", lambda _i, n=n: (toggle_keepalive(n.name), refresh(force=True)))
+            keep_menu.append(item)
+        if keepalive.target:
+            label = next((n.label for n in state.sinks if n.name == keepalive.target), keepalive.target)
+            keep_menu.append(Gtk.SeparatorMenuItem())
+            keep_menu.append(info_item(f"Now keeping {label} awake"))
+        keep.set_submenu(keep_menu)
+        sub.append(keep)
+        top.set_submenu(sub)
+        return top
+
     def build(state, presets, error):
         menu = Gtk.Menu()
         if error:
@@ -265,6 +410,7 @@ def run_indicator():
         menu.append(Gtk.SeparatorMenuItem())
         menu.append(plain("Edit presets…", open_config))
         menu.append(plain("Sound settings…", open_sound_settings))
+        menu.append(advanced_submenu(state))
         menu.show_all()
         ind.set_menu(menu)
 
@@ -281,7 +427,11 @@ def run_indicator():
         except Exception as e:  # keep the icon alive whatever happens
             print(f"audio-switcher: refresh failed: {e}", file=sys.stderr)
             return True
-        sig = (state.signature(), mtime, error)
+        try:
+            keepalive.update(state, load_keepalive())
+        except Exception as e:
+            print(f"audio-switcher: keep-alive failed: {e}", file=sys.stderr)
+        sig = (state.signature(), mtime, error, keepalive.target)
         if force or sig != last["sig"]:
             last["sig"] = sig
             build(state, presets, error)
@@ -289,7 +439,10 @@ def run_indicator():
 
     refresh()
     GLib.timeout_add_seconds(POLL_SECONDS, refresh)
-    Gtk.main()
+    try:
+        Gtk.main()
+    finally:
+        keepalive.stop()
 
 
 # -------------------------------------------------------------------- Popup
