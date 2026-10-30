@@ -82,3 +82,7 @@ Creates `~/.config/autostart/audio-switcher.desktop` and a GNOME custom shortcut
 
 - Code: this repo (`djkimCH/dj-audio-switcher`), checked out at `/data/AI-Workspace/git/dj-audio-switcher`. Autostart + shortcut point here.
 - Per-machine notes (presets, test results): `UbuntuHelper/Ubuntu@{machine}/docs/audio-switcher-setup.md`.
+
+## 7. License
+
+MIT, see [LICENSE](LICENSE).
