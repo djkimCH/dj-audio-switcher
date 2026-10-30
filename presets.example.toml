@@ -1,0 +1,31 @@
+# Audio Switcher presets
+# Edit + save: the top-bar menu picks up changes within ~2 seconds.
+#
+#   name    shown in the menu
+#   output  speaker/headset - text contained in the device name (case-insensitive)
+#   input   microphone      - same
+#           Leave one out to change only the other side.
+#           Use a list for fallbacks, first match wins:  output = ["Odyssey", "HDMI 1"]
+#
+# Exact device names:  audio-switcher.py --list   (in the repo folder)
+# Order here = order in the menu = number key (1-9) in the shortcut popup.
+
+[[preset]]
+name   = "Display speakers + Webcam mic"
+output = "Odyssey G95NC"
+input  = "C920"
+
+[[preset]]
+name   = "Razer headset"
+output = "BlackShark"
+input  = "BlackShark"
+
+[[preset]]
+name   = "Jabra headset"
+output = "Jabra"
+input  = "Jabra"
+
+[[preset]]
+name   = "Laptop speakers + mic"
+output = "Speaker + Headphones"
+input  = "Digital Microphone"
