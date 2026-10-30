@@ -23,7 +23,8 @@ APP_ID = "net.djelid.AudioSwitcher"
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "audio-switcher" / "presets.toml"
 EXAMPLE = Path(__file__).resolve().parent / "presets.example.toml"
 SETTINGS = CONFIG.parent / "settings.json"   # app-managed (Advanced menu), not hand-edited
-POLL_SECONDS = 2
+POLL_SECONDS = 1
+DEFAULT_CUE = "/usr/share/sounds/Yaru/stereo/message.oga"
 
 
 # ---------------------------------------------------------------- PipeWire
@@ -216,6 +217,46 @@ def toggle_keepalive(node_name):
     save_settings(data)
 
 
+def load_miccue():
+    """Advanced > Mic cue: (all_mics, source names, sound file); all_mics False and
+    no names = off."""
+    mc = load_settings().get("miccue") or {}
+    devices = tuple(d for d in mc.get("devices", []) if isinstance(d, str))
+    sound = mc.get("sound") or DEFAULT_CUE
+    if not Path(sound).exists():
+        sound = "/usr/share/sounds/freedesktop/stereo/message.oga"
+    return bool(mc.get("all")), devices, sound
+
+
+def toggle_miccue(source_name=None):
+    """None toggles "All microphones", else one mic."""
+    data = load_settings()
+    mc = data.setdefault("miccue", {"all": False, "devices": []})
+    if source_name is None:
+        mc["all"] = not mc.get("all")
+    else:
+        devices = mc.setdefault("devices", [])
+        devices.remove(source_name) if source_name in devices else devices.append(source_name)
+    save_settings(data)
+
+
+class MicCue:
+    """Plays a short sound on the current output when an app starts recording
+    from a microphone (privacy cue; also wakes headsets with an auto-off timer)."""
+
+    def __init__(self):
+        self.prev = None        # mics being recorded at the last poll
+
+    def update(self, state, cfg):
+        now = {n.name for n in state.sources if n.name in state.recording}
+        started = now - self.prev if self.prev is not None else set()   # no cue at startup
+        self.prev = now
+        all_mics, devices, sound = cfg
+        if any(all_mics or name in devices for name in started):
+            subprocess.Popen(["pw-play", "--volume", "0.6", sound],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 class KeepAlive:
     """Plays inaudible silence to a headset while an app records from its mic,
     so the headset's own auto-off timer (which only counts incoming sound)
@@ -322,6 +363,7 @@ def run_indicator():
     ind.set_title("Audio Switcher")
     last = {"sig": None}
     keepalive = KeepAlive()
+    miccue = MicCue()
 
     def radio(label, active, sensitive, callback):
         item = Gtk.CheckMenuItem(label=label)
@@ -371,6 +413,25 @@ def run_indicator():
             keep_menu.append(info_item(f"Now keeping {label} awake"))
         keep.set_submenu(keep_menu)
         sub.append(keep)
+
+        cue = Gtk.MenuItem(label="Mic cue")
+        cue_menu = Gtk.Menu()
+        cue_menu.append(info_item("Short sound when an app starts using a mic"))
+        cue_menu.append(Gtk.SeparatorMenuItem())
+        all_mics, cue_devices, _sound = load_miccue()
+        all_item = Gtk.CheckMenuItem(label="All microphones")
+        all_item.set_active(all_mics)
+        all_item.connect("activate", lambda _i: (toggle_miccue(), refresh(force=True)))
+        cue_menu.append(all_item)
+        cue_menu.append(Gtk.SeparatorMenuItem())
+        for n in state.sources:
+            item = Gtk.CheckMenuItem(label=n.label)
+            item.set_active(all_mics or n.name in cue_devices)
+            item.set_sensitive(not all_mics)
+            item.connect("activate", lambda _i, n=n: (toggle_miccue(n.name), refresh(force=True)))
+            cue_menu.append(item)
+        cue.set_submenu(cue_menu)
+        sub.append(cue)
         top.set_submenu(sub)
         return top
 
@@ -411,6 +472,7 @@ def run_indicator():
             return True
         try:
             keepalive.update(state, load_keepalive())
+            miccue.update(state, load_miccue())
         except Exception as e:
             print(f"audio-switcher: keep-alive failed: {e}", file=sys.stderr)
         sig = (state.signature(), mtime, error, keepalive.target)

@@ -13,12 +13,14 @@ mouse. Built 2026-10-30 on X1Ubuntu (no existing tool did presets).
   V3 Pro: 15 min) power off when no sound is played, even while you talk into the mic: on Linux,
   PipeWire stops sending data to an idle output. **Advanced ▸ Keep awake** fixes this per device;
   see [§3](#3-keep-awake-headset-auto-off-fix).
+- **Mic cue (privacy):** a short sound whenever an app starts using a microphone, for all mics
+  or selected ones (Advanced ▸ Mic cue), see [§4](#4-mic-cue-privacy).
 
 ## 1. Use
 
 | Where | What |
 |-------|------|
-| Top-bar icon | Speaker icon (headphones icon when a USB headset is the output). Click → presets (● = active), `Output: …` / `Input: …` submenus for mix & match, `Edit presets…`, `Sound settings…`, `Advanced ▸ Keep awake` |
+| Top-bar icon | Speaker icon (headphones icon when a USB headset is the output). Click → presets (● = active), `Output: …` / `Input: …` submenus for mix & match, `Edit presets…`, `Sound settings…`, `Advanced ▸ Keep awake / Mic cue` |
 | `Super+T` | Same menu (without Advanced), near the mouse. Arrows + Enter, Right/Left into/out of submenus, number keys `1`–`9` = preset, Esc / click outside = close |
 | CLI | `audio-switcher.py --list` (devices + presets), `--apply 2` or `--apply "Razer headset"` |
 
@@ -31,7 +33,7 @@ mic — an app pinned to a specific device ignores the switch.
 ## 2. Presets
 
 File: `~/.config/audio-switcher/presets.toml` (machine-local, created from
-[presets.example.toml](presets.example.toml) on first run; the example holds X1Ubuntu's devices, so adapt it on other machines, see §6). Changes are picked up within ~2 s.
+[presets.example.toml](presets.example.toml) on first run; the example holds X1Ubuntu's devices, so adapt it on other machines, see §7). Changes are picked up within ~1 s.
 
 ```toml
 [[preset]]
@@ -59,7 +61,21 @@ submenu shows "Now keeping … awake".
 
 Stored in `~/.config/audio-switcher/settings.json` (managed by the menu).
 
-## 4. Install / uninstall (per user, no sudo)
+## 4. Mic cue (privacy)
+
+The GNOME mic symbol in the top bar is easy to miss. With **Advanced ▸ Mic cue** you hear a short,
+quiet sound (Yaru "message" pop, 60 % volume) on your current output whenever an app **starts**
+using a microphone. Choose **All microphones** or tick single mics. Off by default.
+
+Side effect: the cue also resets the auto-off timer of a headset at every recording start, so for
+short recordings (dictation, voice messages) it already prevents the headset from switching off.
+For long recordings use Keep awake (§3).
+
+Notes: detection polls every second, so the cue comes ~0.5–1 s after recording starts. Opening
+GNOME's sound settings also triggers it (its input level meter records). Other sound:
+`"sound": "/path/to/file.oga"` under `"miccue"` in `settings.json`.
+
+## 5. Install / uninstall (per user, no sudo)
 
 ```bash
 ./install.sh              # autostart + shortcut <Super>t + start
@@ -72,15 +88,17 @@ Needs `pw-dump`, `wpctl` (PipeWire/WirePlumber), `python3` ≥ 3.11,
 Creates `~/.config/autostart/audio-switcher.desktop` and a GNOME custom shortcut
 (Settings → Keyboard → Custom Shortcuts → "Audio Switcher").
 
-## 5. How it works
+## 6. How it works
 
-- **State:** `pw-dump` every 2 s (~20 ms). Ports PipeWire reports as unavailable (empty HDMI
+- **State:** `pw-dump` every 1 s (~20 ms). Ports PipeWire reports as unavailable (empty HDMI
   ports, unplugged jack) are hidden — same list as GNOME's own sound menu.
 - **Switch:** `wpctl set-default <id>`; ids are looked up fresh by stable `node.name`.
 - **Keep awake:** a `pw-cat --playback --target <headset>` stream fed from `/dev/zero`, started
-  and stopped by the 2 s poll. "Recording" = a PipeWire link from the headset's mic (same
+  and stopped by the 1 s poll. "Recording" = a PipeWire link from the headset's mic (same
   device id as the ticked output) to an app's input stream. The stream
   dies with the menu process (`PR_SET_PDEATHSIG`).
+- **Mic cue:** the same poll compares which mics are recorded with the previous poll; a newly
+  recorded (enabled) mic plays the cue with `pw-play` on the default output.
 - **Menu:** separate Python process, not a GNOME Shell extension → a bug can't crash the session
   and GNOME upgrades don't require porting (relies only on Ubuntu's AppIndicator extension).
 - **Shortcut popup:** Wayland doesn't let apps position windows or ask where the mouse is. So
@@ -94,7 +112,7 @@ Creates `~/.config/autostart/audio-switcher.desktop` and a GNOME custom shortcut
   disappears. A GNOME Shell extension would do this cleanly, but it can crash the session and
   needs porting on every GNOME upgrade. Real blur behind the menu is impossible for apps.
 
-## 6. Known limitations
+## 7. Known limitations
 
 - **Fresh install on another machine: all presets greyed out**
   ([issue #1](https://github.com/djkimCH/dj-audio-switcher/issues/1)). The example presets are
@@ -107,11 +125,11 @@ Creates `~/.config/autostart/audio-switcher.desktop` and a GNOME custom shortcut
 - The overlay appears on the screen GNOME chooses. If the mouse is on the other screen, the
   menu opens centered on GNOME's screen.
 
-## 7. Where things live
+## 8. Where things live
 
 - Code: this repo (`djkimCH/dj-audio-switcher`), checked out at `/data/AI-Workspace/git/dj-audio-switcher`. Autostart + shortcut point here.
 - Per-machine notes (presets, test results): `UbuntuHelper/Ubuntu@{machine}/docs/audio-switcher-setup.md`.
 
-## 8. License
+## 9. License
 
 MIT, see [LICENSE](LICENSE).
