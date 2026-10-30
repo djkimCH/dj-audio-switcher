@@ -199,15 +199,15 @@ def save_settings(data):
 
 
 def load_keepalive():
-    """Advanced > Keep awake: (device node names, idle_minutes) or None."""
+    """Advanced > Keep awake: tuple of output node names it is enabled for."""
     ka = load_settings().get("keepalive") or {}
-    devices = tuple(d for d in ka.get("devices", []) if isinstance(d, str))
-    return (devices, float(ka.get("idle_minutes", 15))) if devices else None
+    return tuple(d for d in ka.get("devices", []) if isinstance(d, str))
 
 
 def toggle_keepalive(node_name):
     data = load_settings()
-    ka = data.setdefault("keepalive", {"devices": [], "idle_minutes": 15})
+    ka = data.setdefault("keepalive", {"devices": []})
+    ka.pop("idle_minutes", None)
     devices = ka.setdefault("devices", [])
     if node_name in devices:
         devices.remove(node_name)
@@ -216,45 +216,28 @@ def toggle_keepalive(node_name):
     save_settings(data)
 
 
-def idle_ms():
-    """Milliseconds since the last keyboard/mouse input (GNOME), None if unknown."""
-    try:
-        out = subprocess.run(["gdbus", "call", "--session", "--dest", "org.gnome.Mutter.IdleMonitor",
-                              "--object-path", "/org/gnome/Mutter/IdleMonitor/Core",
-                              "--method", "org.gnome.Mutter.IdleMonitor.GetIdletime"],
-                             capture_output=True, text=True, timeout=2).stdout
-        return int(out.strip().strip("(),").split()[-1])
-    except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
-        return None
-
-
 class KeepAlive:
-    """Plays inaudible silence to a headset so its own auto-off timer doesn't
-    fire while it's in use. Runs only while the headset (output or mic) is
-    selected AND the user is active (recent keyboard/mouse input, or an app is
-    recording from its mic). Otherwise the headset's own timer applies."""
+    """Plays inaudible silence to a headset while an app records from its mic,
+    so the headset's own auto-off timer (which only counts incoming sound)
+    doesn't fire during calls or dictation. No mic use -> its timer applies."""
 
     def __init__(self):
         self.proc = None
         self.target = None      # node.name currently kept awake
 
-    def update(self, state, cfg):
+    def update(self, state, enabled):
         if self.proc and self.proc.poll() is not None:   # stream died (headset off)
             self.proc, self.target = None, None
         want = None
-        if cfg:
-            patterns, idle_minutes = cfg
-            sink = _find(state.sinks, patterns)
+        for sink in state.sinks:
+            if sink.name not in enabled:
+                continue
             # the headset's mic = a source on the same hardware device
-            source = next((n for n in state.sources
-                           if sink and n.device is not None and n.device == sink.device), None)
-            selected = ((sink and sink.name == state.default_sink)
-                        or (source and source.name == state.default_source))
-            recording = source is not None and source.name in state.recording
-            idle = idle_ms()
-            active = recording or idle is None or idle < idle_minutes * 60_000
-            if sink and selected and active:
+            mic_in_use = any(n.device is not None and n.device == sink.device and n.name in state.recording
+                             for n in state.sources)
+            if mic_in_use:
                 want = sink.name
+                break
         if want != self.target:
             self.stop()
             if want:
@@ -374,10 +357,9 @@ def run_indicator():
         keep = Gtk.MenuItem(label="Keep awake")
         keep_menu = Gtk.Menu()
         keep_menu.append(info_item("For headsets that switch off by themselves:"))
-        keep_menu.append(info_item("plays silence while selected and you're active"))
+        keep_menu.append(info_item("plays silence while an app uses its mic"))
         keep_menu.append(Gtk.SeparatorMenuItem())
-        cfg = load_keepalive()
-        enabled = cfg[0] if cfg else ()
+        enabled = load_keepalive()
         for n in state.sinks:
             item = Gtk.CheckMenuItem(label=n.label)
             item.set_active(n.name in enabled)

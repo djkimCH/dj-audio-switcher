@@ -51,19 +51,13 @@ sound". On Linux that also happens **while you use the mic** (calls, dictation):
 an output after 5 s of silence, so the headset receives nothing and its timer runs out.
 
 **Fix:** top-bar menu → **Advanced ▸ Keep awake** → tick the headset. Off by default, per device.
-The tool then plays **inaudible silence** to that headset, but **only while**:
+While **an app records from that headset's mic** (call, dictation; GNOME shows the mic symbol in
+the top bar), the tool plays **inaudible silence** to the headset, so its timer never runs out.
+This works whether or not the headset is the selected device. As soon as no app uses the mic, the
+silence stops and the headset's own timer applies again, which saves battery. While active, the
+submenu shows "Now keeping … awake".
 
-1. the headset is selected (its output **or** its mic is the current default), **and**
-2. you are active: keyboard/mouse used within the last 15 min (GNOME idle time), **or** an app
-   is currently recording from the headset's mic (e.g. a long dictation without typing).
-
-Otherwise the silence stops and the headset's own timer applies again, so it still powers off
-when you walk away, the laptop sleeps or another device is selected. Saves battery compared with
-keeping it awake permanently. While active, the submenu shows "Now keeping … awake".
-
-Stored in `~/.config/audio-switcher/settings.json` (managed by the menu). The idle limit can be
-changed there (`"idle_minutes": 15`). Your headset's own timer (e.g. 15 min) comes on top, so with
-the defaults it switches off ~30 min after your last input.
+Stored in `~/.config/audio-switcher/settings.json` (managed by the menu).
 
 ## 4. Install / uninstall (per user, no sudo)
 
@@ -84,8 +78,8 @@ Creates `~/.config/autostart/audio-switcher.desktop` and a GNOME custom shortcut
   ports, unplugged jack) are hidden — same list as GNOME's own sound menu.
 - **Switch:** `wpctl set-default <id>`; ids are looked up fresh by stable `node.name`.
 - **Keep awake:** a `pw-cat --playback --target <headset>` stream fed from `/dev/zero`, started
-  and stopped by the 2 s poll. Idle time via `org.gnome.Mutter.IdleMonitor`. "Recording" = a
-  PipeWire link from the headset's mic (same device id) to an app's input stream. The stream
+  and stopped by the 2 s poll. "Recording" = a PipeWire link from the headset's mic (same
+  device id as the ticked output) to an app's input stream. The stream
   dies with the menu process (`PR_SET_PDEATHSIG`).
 - **Menu:** separate Python process, not a GNOME Shell extension → a bug can't crash the session
   and GNOME upgrades don't require porting (relies only on Ubuntu's AppIndicator extension).
